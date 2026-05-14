@@ -83,8 +83,10 @@
   <header>
     <h1>Batch payment report</h1>
     <div class="subtitle">
-      Upload an Excel file with a <strong>loan no</strong> column, set the date window, then download
-      consolidated <strong>Payment Received</strong> rows (online vs cash). <a href="{% url 'index' %}">Single SOA lookup</a>
+      Upload an Excel with a <strong>loan no</strong> column and a date window. You will be redirected to a
+      <strong>progress page</strong> (10,000+ loans can run many hours; keep the tab open).
+      The Excel downloads automatically when the job completes. You can also use the download button.
+      <a href="{% url 'index' %}">Single SOA lookup</a>
     </div>
   </header>
 
@@ -115,6 +117,11 @@
       Rows are matched when text includes <em>Payment Received</em> plus either
       <code>ONLINE payment No</code> or <code>CASH payment No</code> (Bajaj SOA layout), or older
       ONLINE / reference wording.
+    </p>
+    <p class="hint">
+      The result workbook has a <strong>Payments</strong> sheet and a <strong>Loan status</strong> sheet (per loan).
+      Bookmark the progress URL after submit (it contains a private access token). Run <code>python manage.py migrate</code> once for job storage.
+      Optional cleanup: <code>python manage.py purge_old_batch_jobs</code> (see <code>SOA_BATCH_JOB_RETENTION_DAYS</code>).
     </p>
   </section>
 </body>

@@ -2,7 +2,8 @@
 
 Bajaj may return either structured JSON (nested objects/arrays) or embed the SOA
 as a base64 PDF under a ``url`` field (often nested, e.g. ``data[0].url``). This
-module tries JSON row discovery first, then decodes the PDF and scans text.
+module scans **both** JSON and PDF, merges results, and dedupes — JSON-only
+matches with missing dates used to hide PDF rows entirely.
 
 Field names are not documented in-repo; JSON discovery walks dicts and uses
 fuzzy key matching for date / particulars / credit columns.
@@ -50,6 +51,9 @@ _PARTICULARS_KEYS = (
     "tranparticulars",
     "transdesc",
     "details",
+    "txndescription",
+    "transactiondescription",
+    "narrative",
 )
 
 _DATE_KEYS = (
@@ -126,6 +130,40 @@ def parse_dd_mon_yyyy(s: str) -> date | None:
         return None
 
 
+# Numeric dates often appear in JSON or pasted SOA text (India: DD/MM/YYYY).
+_RE_DMY_NUMERIC = re.compile(r"\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})\b")
+
+
+def parse_dmy_numeric(s: str) -> date | None:
+    """Parse first DD/MM/YYYY (or DD-MM-YYYY) in ``s``."""
+    m = _RE_DMY_NUMERIC.search(s.strip())
+    if not m:
+        return None
+    d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not (1 <= mo <= 12 and 1 <= d <= 31):
+        return None
+    try:
+        return date(y, mo, d)
+    except ValueError:
+        return None
+
+
+def _payment_line_context(t: str) -> bool:
+    """True if text looks like a Bajaj customer payment / receipt line."""
+    if "payment received" in t or "payment recieved" in t:
+        return True
+    if "repayment received" in t or "repayment recd" in t:
+        return True
+    if "instalment received" in t or "installment received" in t:
+        return True
+    if "payment recd" in t or "pmt received" in t or "pmt recd" in t:
+        return True
+    # Channel wording alone (some SOAs split "Payment Received" across columns).
+    if re.search(r"online\s+payment\s*no", t) or re.search(r"cash\s+payment\s*no", t):
+        return True
+    return False
+
+
 def classify_payment_type(particulars: str) -> PaymentType | None:
     """Return payment channel if this row is a 'Payment Received' line, else None.
 
@@ -140,7 +178,7 @@ def classify_payment_type(particulars: str) -> PaymentType | None:
     if not particulars or not isinstance(particulars, str):
         return None
     t = re.sub(r"\s+", " ", particulars.strip().lower())
-    if "payment received" not in t and "payment recieved" not in t:
+    if not _payment_line_context(t):
         return None
 
     if re.search(r"online\s+payment\s*no", t):
@@ -188,6 +226,9 @@ def _date_from_dict(d: dict[str, Any]) -> date | None:
                 v = d.get(orig)
                 if isinstance(v, str):
                     parsed = parse_dd_mon_yyyy(v)
+                    if parsed:
+                        return parsed
+                    parsed = parse_dmy_numeric(v)
                     if parsed:
                         return parsed
                     try:
@@ -243,6 +284,8 @@ def extract_payment_rows_from_json(soa_data: Any) -> list[dict[str, Any]]:
         dt = _date_from_dict(d)
         if dt is None:
             dt = parse_dd_mon_yyyy(parts)
+        if dt is None:
+            dt = parse_dmy_numeric(parts)
         amt = _credit_from_dict(d)
         key = (parts[:220], str(dt or ""), ptype)
         if key in seen:
@@ -257,6 +300,31 @@ def extract_payment_rows_from_json(soa_data: Any) -> list[dict[str, Any]]:
                 "source": "json",
             }
         )
+    return out
+
+
+def _dedupe_key_payment_row(r: dict[str, Any]) -> tuple[str, str, str]:
+    dt = r.get("date")
+    if isinstance(dt, datetime):
+        dt = dt.date()
+    ds = dt.isoformat() if isinstance(dt, date) else ""
+    ps = re.sub(r"\s+", " ", (r.get("particulars") or "")[:260].strip().lower())
+    return (ds, ps, str(r.get("payment_type") or ""))
+
+
+def _merge_payment_sources(
+    *sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Combine JSON + PDF hits; drop exact duplicates (same date, text, channel)."""
+    seen: set[tuple[str, str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for rows in sources:
+        for r in rows:
+            k = _dedupe_key_payment_row(r)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(r)
     return out
 
 
@@ -345,7 +413,10 @@ def extract_payment_rows_from_pdf_b64(b64: str) -> list[dict[str, Any]]:
     pieces: list[str] = []
     for p in _RE_ROW_BOUNDARY.split(normalized):
         p = p.strip()
-        if p and _RE_DD_MON_YYYY.search(p[:24]):
+        if p and (
+            _RE_DD_MON_YYYY.search(p[:200])
+            or parse_dmy_numeric(p[:400]) is not None
+        ):
             pieces.append(p)
 
     if not pieces:
@@ -353,6 +424,16 @@ def extract_payment_rows_from_pdf_b64(b64: str) -> list[dict[str, Any]]:
             chunk = normalized[m.start() : m.start() + 700].strip()
             if "payment received" in chunk.lower():
                 pieces.append(chunk)
+        if not pieces:
+            for m in _RE_DMY_NUMERIC.finditer(normalized):
+                chunk = normalized[m.start() : m.start() + 700].strip()
+                tl = chunk.lower()
+                if (
+                    "payment received" in tl
+                    or "online payment" in tl
+                    or "cash payment" in tl
+                ):
+                    pieces.append(chunk)
 
     out: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -360,11 +441,13 @@ def extract_payment_rows_from_pdf_b64(b64: str) -> list[dict[str, Any]]:
         ptype = classify_payment_type(chunk)
         if ptype is None:
             continue
+        dt: date | None = None
         dm = _RE_DD_MON_YYYY.search(chunk)
-        if not dm:
-            continue
-        dt = parse_dd_mon_yyyy(dm.group(0))
-        if not dt:
+        if dm:
+            dt = parse_dd_mon_yyyy(dm.group(0))
+        if dt is None:
+            dt = parse_dmy_numeric(chunk)
+        if dt is None:
             continue
         amt = _heuristic_amount_from_segment(chunk)
         sk = (str(dt), chunk[:200])
@@ -389,11 +472,14 @@ def extract_payment_rows_from_pdf_b64(b64: str) -> list[dict[str, Any]]:
 
 
 def extract_payment_rows(soa_data: Any) -> list[dict[str, Any]]:
-    """Prefer JSON hits; if none, scan embedded PDF (base64 under ``url``)."""
+    """Merge JSON hits with embedded PDF (``url`` base64) hits.
+
+    Previously JSON-only matches (e.g. nested dicts with ``Particulars`` but no
+    parseable ``Date``) returned a non-empty list and **skipped the PDF entirely**,
+    so real statement lines never reached the report. We always scan both and
+    dedupe.
+    """
     js = extract_payment_rows_from_json(soa_data)
-    if js:
-        return js
     b64 = extract_pdf_base64_from_tree(soa_data)
-    if b64:
-        return extract_payment_rows_from_pdf_b64(b64)
-    return []
+    pdf = extract_payment_rows_from_pdf_b64(b64) if b64 else []
+    return _merge_payment_sources(js, pdf)

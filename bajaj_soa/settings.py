@@ -32,12 +32,15 @@ CSRF_TRUSTED_ORIGINS = config(
 )
 
 INSTALLED_APPS = [
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
     "django.contrib.staticfiles",
     "soa",
 ]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -61,8 +64,26 @@ TEMPLATES = [
 WSGI_APPLICATION = "bajaj_soa.wsgi.application"
 ASGI_APPLICATION = "bajaj_soa.asgi.application"
 
-# This app has no models / no auth / no sessions: no DB is needed.
-DATABASES: dict = {}
+# SQLite for batch job metadata + file paths (async payment reports).
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": DATA_DIR / "app.sqlite3",
+        "OPTIONS": {
+            "timeout": 30,
+        },
+    }
+}
+
+MEDIA_URL = "media/"
+MEDIA_ROOT = BASE_DIR / "media"
+
+# Small cookie-backed session (batch job UUIDs); avoids extra DB tables for sessions.
+SESSION_ENGINE = "django.contrib.sessions.backends.signed_cookies"
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
 
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "Asia/Kolkata"
@@ -116,9 +137,28 @@ LOGGING = {
 BAJAJ_USERNAME = config("BAJAJ_USERNAME", default="")
 BAJAJ_PASSWORD = config("BAJAJ_PASSWORD", default="")
 
+BAJAJ_SESSION_RENEW_BUFFER_SECONDS = config(
+    "BAJAJ_SESSION_RENEW_BUFFER_SECONDS",
+    default=180,
+    cast=float,
+)
+BAJAJ_SOA_FETCH_MAX_RETRIES = config(
+    "BAJAJ_SOA_FETCH_MAX_RETRIES",
+    default=8,
+    cast=int,
+)
+
 # --- Batch payment report (soa.batch_report / payment_report view) ---
 SOA_BATCH_DELAY_SECONDS = config("SOA_BATCH_DELAY_SECONDS", default=0.35, cast=float)
-SOA_BATCH_MAX_LOANS = config("SOA_BATCH_MAX_LOANS", default=500, cast=int)
-SOA_BATCH_MAX_UPLOAD_BYTES = config(
-    "SOA_BATCH_MAX_UPLOAD_BYTES", default=2_097_152, cast=int
+SOA_BATCH_MAX_LOANS = config("SOA_BATCH_MAX_LOANS", default=20000, cast=int)
+SOA_BATCH_FETCH_WORKERS = config(
+    "SOA_BATCH_FETCH_WORKERS",
+    default=10,
+    cast=int,
 )
+SOA_BATCH_MAX_UPLOAD_BYTES = config(
+    "SOA_BATCH_MAX_UPLOAD_BYTES", default=10_485_760, cast=int
+)
+
+# Delete batch job files older than this many days (see management command).
+SOA_BATCH_JOB_RETENTION_DAYS = config("SOA_BATCH_JOB_RETENTION_DAYS", default=7, cast=int)

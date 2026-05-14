@@ -6,22 +6,30 @@ import json
 import logging
 import re
 from datetime import date, datetime
-from io import BytesIO
+from urllib.parse import quote
 
 from django.conf import settings
-from django.http import FileResponse, HttpRequest, HttpResponse, JsonResponse
-from django.shortcuts import render
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.http import (
+    Http404,
+    HttpRequest,
+    HttpResponse,
+    JsonResponse,
+)
+from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.views.decorators.csrf import csrf_exempt, csrf_protect
 from django.views.decorators.http import require_GET, require_http_methods
 
-from .batch_report import build_payment_report
+from .batch_job_worker import start_batch_report_job_thread
 from .client import (
     BajajClient,
     BajajError,
     BajajLoginError,
     BajajParallelSessionError,
 )
-from .excel_io import read_loan_numbers_from_xlsx, write_payment_report_xlsx
+from .excel_io import read_loan_numbers_from_xlsx
+from .models import BatchReportJob
 
 logger = logging.getLogger(__name__)
 
@@ -183,38 +191,91 @@ def payment_report(request: HttpRequest) -> HttpResponse:
             status=400,
         )
 
-    try:
-        payments, statuses = build_payment_report(loans, date_from, date_to)
-    except ValueError as exc:
-        return render(
-            request,
-            "soa/payment_report.html",
-            {"error": str(exc), "date_from": df_raw, "date_to": dt_raw},
-            status=400,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Batch report failed")
-        return render(
-            request,
-            "soa/payment_report.html",
-            {
-                "error": str(exc),
-                "date_from": df_raw,
-                "date_to": dt_raw,
-            },
-            status=502,
-        )
+    fname = (upload.name or "loans.xlsx").strip() or "loans.xlsx"
+    if not fname.lower().endswith(".xlsx"):
+        fname += ".xlsx"
+    total_cap = min(
+        len(loans), int(getattr(settings, "SOA_BATCH_MAX_LOANS", 20000))
+    )
+    up = SimpleUploadedFile(
+        fname,
+        raw,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    job = BatchReportJob.objects.create(
+        date_from=date_from,
+        date_to=date_to,
+        total_loans=total_cap,
+        status=BatchReportJob.Status.PENDING,
+        input_file=up,
+    )
+    job.refresh_from_db()
 
-    xlsx = write_payment_report_xlsx(payments, statuses)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M")
-    resp = FileResponse(
-        BytesIO(xlsx),
-        as_attachment=True,
-        filename=f"soa-payments-{stamp}.xlsx",
+    start_batch_report_job_thread(job.pk)
+    target = (
+        reverse("batch_job_status", kwargs={"job_id": job.pk})
+        + "?access="
+        + quote(job.access_token, safe="")
+    )
+    return redirect(target)
+
+
+def _batch_job_for_request(request: HttpRequest, job_id) -> BatchReportJob:
+    job = get_object_or_404(BatchReportJob, pk=job_id)
+    if request.GET.get("access") != job.access_token:
+        raise Http404("Job not found.")
+    return job
+
+
+@require_http_methods(["GET"])
+def batch_job_status(request: HttpRequest, job_id) -> HttpResponse:
+    job = _batch_job_for_request(request, job_id)
+    return render(
+        request,
+        "soa/batch_job_status.html",
+        {
+            "job": job,
+        },
+    )
+
+
+@require_http_methods(["GET"])
+def batch_job_status_json(request: HttpRequest, job_id) -> JsonResponse:
+    job = _batch_job_for_request(request, job_id)
+    return JsonResponse(
+        {
+            "status": job.status,
+            "total_loans": job.total_loans,
+            "processed_loans": job.processed_loans,
+            "payment_count": job.payment_count,
+            "error": (job.error_message[:500] if job.error_message else ""),
+        }
+    )
+
+
+@require_http_methods(["GET"])
+def batch_job_download(request: HttpRequest, job_id) -> HttpResponse:
+    job = _batch_job_for_request(request, job_id)
+    if job.status != BatchReportJob.Status.DONE:
+        return HttpResponse(
+            "Report is not ready yet. Refresh the status page.",
+            status=409,
+            content_type="text/plain; charset=utf-8",
+        )
+    if not job.result_file:
+        raise Http404("No result file.")
+
+    data = job.result_file.read()
+    stamp = job.updated_at.strftime("%Y%m%d-%H%M") if job.updated_at else "export"
+    fname = f"soa-payments-{stamp}.xlsx"
+    resp = HttpResponse(
+        data,
         content_type=(
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         ),
     )
+    resp["Content-Disposition"] = f'attachment; filename="{fname}"'
+    resp["Content-Length"] = str(len(data))
     return resp
 
 

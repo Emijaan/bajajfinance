@@ -18,11 +18,13 @@ import hashlib
 import json
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 import jwt
 import requests
+from requests.utils import dict_from_cookiejar
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
@@ -46,9 +48,10 @@ iwIDAQAB
 
 BASE_URL = "https://dmsoneportal.bajajfinserv.in"
 
-# Re-login this many seconds before the JWT actually expires so that
-# in-flight requests on a near-expired token don't 401.
-RENEW_BUFFER_SECONDS = 30
+# Fallback JWT renew lead (seconds) when ``BAJAJ_SESSION_RENEW_BUFFER_SECONDS`` is unset.
+# Each ``fetch_soa`` runs ``_ensure_session``; use ~3 minutes so long batches renew
+# before the ~15-minute portal cookie expires.
+RENEW_BUFFER_SECONDS = 180
 
 # Modern Chrome on Windows. Bajaj sniffs UA in places.
 _BROWSER_HEADERS = {
@@ -119,21 +122,70 @@ class BajajClient:
         return cls._singleton
 
     def fetch_soa(self, agreement_no: str) -> Any:
-        """Return the parsed SOA JSON for a given agreement number."""
+        """Return the parsed SOA JSON for a given agreement number.
+
+        Refreshes the portal session before JWT expiry on every call, re-logs in
+        on HTTP 401/403, and retries transient transport errors so long batch jobs
+        can run past the default ~15-minute cookie lifetime.
+
+        Each call uses a short-lived ``requests.Session`` cloned from the shared
+        cookie jar so multiple batch worker threads can post concurrently without
+        sharing one mutable session object.
+        """
         agreement_no = agreement_no.strip().upper()
         if not agreement_no:
             raise BajajError("agreement_no is required")
 
-        with self._lock:
-            self._ensure_session()
+        max_rounds = int(getattr(settings, "BAJAJ_SOA_FETCH_MAX_RETRIES", 8))
+        last_err: BaseException | None = None
+        for n in range(max_rounds):
+            worker = requests.Session()
             try:
-                return self._call_soa(agreement_no)
+                with self._lock:
+                    self._ensure_session()
+                    snap = dict_from_cookiejar(self._session.cookies)
+                    hdrs = list(self._session.headers.items())
+                worker.headers.update(hdrs)
+                worker.cookies.update(snap)
+                data, resp = self._call_soa(agreement_no, http=worker)
+                with self._lock:
+                    self._session.cookies.update(resp.cookies)
+                return data
             except BajajParallelSessionError:
                 raise
-            except _SessionExpired:
-                logger.info("Bajaj session rejected on SOA call; re-login.")
-                self._login()
-                return self._call_soa(agreement_no)
+            except BajajLoginError:
+                raise
+            except _SessionExpired as exc:
+                last_err = exc
+                logger.info(
+                    "Bajaj SOA session rejected (HTTP %s); re-login and retry "
+                    "(%s/%s) for %s.",
+                    getattr(exc, "status", "?"),
+                    n + 1,
+                    max_rounds,
+                    agreement_no,
+                )
+                with self._lock:
+                    self._login()
+            except requests.RequestException as exc:
+                last_err = exc
+                if n >= max_rounds - 1:
+                    raise BajajError(
+                        f"SOA transport failed after {max_rounds} attempts: {exc}"
+                    ) from exc
+                wait = min(30.0, 2.0 * (2**n))
+                logger.warning(
+                    "Bajaj SOA transport error for %s (%s); sleeping %.1fs then retry.",
+                    agreement_no,
+                    exc,
+                    wait,
+                )
+                time.sleep(wait)
+            finally:
+                worker.close()
+        raise BajajError(
+            f"SOA failed after {max_rounds} session renewals (last error: {last_err!r})."
+        ) from last_err
 
     def fetch_soa_after_remote_logout(self, agreement_no: str) -> Any:
         """End the current portal session server-side, log in again, then fetch SOA.
@@ -146,11 +198,38 @@ class BajajClient:
         if not agreement_no:
             raise BajajError("agreement_no is required")
 
+        max_rounds = int(getattr(settings, "BAJAJ_SOA_FETCH_MAX_RETRIES", 8))
         with self._lock:
             self._ensure_session()
             self._remote_logout_current_portal_session()
             self._login()
-            return self._call_soa(agreement_no)
+            last_err: BaseException | None = None
+            for n in range(max_rounds):
+                try:
+                    data, _resp = self._call_soa(agreement_no, http=self._session)
+                    return data
+                except BajajParallelSessionError:
+                    raise
+                except BajajLoginError:
+                    raise
+                except _SessionExpired as exc:
+                    last_err = exc
+                    logger.info(
+                        "SOA after remote-logout: session rejected; re-login (%s/%s).",
+                        n + 1,
+                        max_rounds,
+                    )
+                    self._login()
+                except requests.RequestException as exc:
+                    last_err = exc
+                    if n >= max_rounds - 1:
+                        raise BajajError(
+                            f"SOA transport failed after {max_rounds} attempts: {exc}"
+                        ) from exc
+                    time.sleep(min(30.0, 2.0 * (2**n)))
+            raise BajajError(
+                f"SOA failed after {max_rounds} retries (last: {last_err!r})."
+            ) from last_err
 
     # ------------------------------------------------------------------ #
     # Login / session management
@@ -158,9 +237,16 @@ class BajajClient:
 
     def _ensure_session(self) -> None:
         now = datetime.now(timezone.utc)
+        buffer = float(
+            getattr(
+                settings,
+                "BAJAJ_SESSION_RENEW_BUFFER_SECONDS",
+                RENEW_BUFFER_SECONDS,
+            )
+        )
         if (
             self._expires_at is None
-            or (self._expires_at - now).total_seconds() < RENEW_BUFFER_SECONDS
+            or (self._expires_at - now).total_seconds() < buffer
         ):
             self._login()
 
@@ -369,7 +455,17 @@ class BajajClient:
     # SOA call
     # ------------------------------------------------------------------ #
 
-    def _call_soa(self, agreement_no: str) -> Any:
+    def _call_soa(
+        self,
+        agreement_no: str,
+        http: requests.Session | None = None,
+    ) -> tuple[Any, requests.Response]:
+        """POST GetSOAReport; return parsed payload and the raw response.
+
+        ``http`` defaults to ``self._session``. For concurrent batch fetches,
+        pass a short-lived session that carries a snapshot of auth cookies.
+        """
+        sess = http if http is not None else self._session
         url = f"{BASE_URL}/agency/api/ReportAgency/GetSOAReport"
         # Hand-serialize so the bytes we sign with MD5 are byte-identical
         # to the bytes we send in the body. Angular's JSON.stringify emits
@@ -391,9 +487,7 @@ class BajajClient:
             "Estag": estag,
         }
         logger.debug("POST %s body=%s estag=%s", url, body_bytes, estag)
-        resp = self._session.post(
-            url, data=body_bytes, headers=headers, timeout=60
-        )
+        resp = sess.post(url, data=body_bytes, headers=headers, timeout=60)
 
         if resp.status_code in (401, 403):
             raise _SessionExpired(resp.status_code)
@@ -416,10 +510,10 @@ class BajajClient:
             try:
                 data = json.loads(resp.text)
             except json.JSONDecodeError:
-                return {"raw": resp.text}
+                data = {"raw": resp.text}
 
         self._raise_if_parallel_session_payload(data)
-        return data
+        return data, resp
 
     # ------------------------------------------------------------------ #
     # Helpers
