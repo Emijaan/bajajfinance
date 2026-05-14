@@ -72,6 +72,10 @@ class BajajLoginError(BajajError):
     """Login (RSA / credentials / COC) failed."""
 
 
+class BajajParallelSessionError(BajajError):
+    """Portal indicates another / conflicting session; user may force remote logout."""
+
+
 class BajajClient:
     """Session-managing HTTP client for the Bajaj DMS Agency portal."""
 
@@ -96,6 +100,7 @@ class BajajClient:
         self._lock = threading.RLock()
         self._expires_at: datetime | None = None
         self._user_id: str | None = None
+        self._portal_session_id: str | None = None
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -123,10 +128,29 @@ class BajajClient:
             self._ensure_session()
             try:
                 return self._call_soa(agreement_no)
+            except BajajParallelSessionError:
+                raise
             except _SessionExpired:
                 logger.info("Bajaj session rejected on SOA call; re-login.")
                 self._login()
                 return self._call_soa(agreement_no)
+
+    def fetch_soa_after_remote_logout(self, agreement_no: str) -> Any:
+        """End the current portal session server-side, log in again, then fetch SOA.
+
+        Mirrors the DMS flow: ``POST /common/api/Auth/UpdateLogoutInfo`` with the
+        active ``PortalSession`` JWT's ``SessionId``, ``GET /login``, then a fresh
+        RSA login and SOA request.
+        """
+        agreement_no = agreement_no.strip().upper()
+        if not agreement_no:
+            raise BajajError("agreement_no is required")
+
+        with self._lock:
+            self._ensure_session()
+            self._remote_logout_current_portal_session()
+            self._login()
+            return self._call_soa(agreement_no)
 
     # ------------------------------------------------------------------ #
     # Login / session management
@@ -145,6 +169,7 @@ class BajajClient:
         self._session.cookies.clear()
         self._expires_at = None
         self._user_id = None
+        self._portal_session_id = None
 
         # Field shape & values mirror the Bajaj login page exactly. The
         # frontend's first ("Get") call to /api/Authorize/Login is:
@@ -200,6 +225,7 @@ class BajajClient:
             raise BajajLoginError("PortalSession JWT has no 'exp' claim")
         self._expires_at = datetime.fromtimestamp(exp, tz=timezone.utc)
         self._user_id = claims.get("Userid") or claims.get("unique_name")
+        self._portal_session_id = self._session_id_from_claims(claims)
         logger.info(
             "Bajaj login OK as %s; session valid until %s",
             self._user_id,
@@ -272,6 +298,73 @@ class BajajClient:
         except requests.RequestException as exc:
             logger.warning("Agency priming failed (non-fatal): %s", exc)
 
+    def _remote_logout_current_portal_session(self) -> None:
+        """Notify Bajaj that this ``SessionID`` is logging out, then open ``/login``."""
+        portal_cookie = self._session.cookies.get("PortalSession")
+        if not portal_cookie:
+            logger.info("UpdateLogoutInfo skipped: no PortalSession cookie")
+            return
+
+        claims = jwt.decode(
+            portal_cookie,
+            options={"verify_signature": False, "verify_exp": False},
+        )
+        session_id = self._session_id_from_claims(claims)
+        if not session_id:
+            logger.warning("UpdateLogoutInfo skipped: no SessionId in PortalSession")
+            return
+
+        body_obj = {"Username": self._username, "SessionID": session_id}
+        body_bytes = json.dumps(
+            body_obj, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        estag = self._compute_estag(body_bytes)
+        url = f"{BASE_URL}/common/api/Auth/UpdateLogoutInfo"
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": BASE_URL,
+            "Referer": f"{BASE_URL}/agency/home",
+            "Sourceuri": f"{BASE_URL}/agency/home",
+            "X-Requested-With": "XMLHttpRequest",
+            "Show-Spinner": "true",
+            "Estag": estag,
+        }
+        try:
+            resp = self._session.post(
+                url, data=body_bytes, headers=headers, timeout=30
+            )
+            logger.info("UpdateLogoutInfo -> HTTP %s", resp.status_code)
+        except requests.RequestException as exc:
+            logger.warning("UpdateLogoutInfo request failed: %s", exc)
+
+        try:
+            self._session.get(
+                f"{BASE_URL}/login",
+                headers={
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;"
+                        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+                    ),
+                    "Referer": f"{BASE_URL}/agency/home",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            logger.warning("GET /login after logout failed (non-fatal): %s", exc)
+
+    @staticmethod
+    def _session_id_from_claims(claims: dict[str, Any]) -> str | None:
+        sid = (
+            claims.get("SessionId")
+            or claims.get("SessionID")
+            or claims.get("sessionId")
+        )
+        if isinstance(sid, str) and sid.strip():
+            return sid.strip()
+        return None
+
     # ------------------------------------------------------------------ #
     # SOA call
     # ------------------------------------------------------------------ #
@@ -318,12 +411,15 @@ class BajajClient:
 
         ctype = resp.headers.get("Content-Type", "")
         if "application/json" in ctype.lower():
-            return resp.json()
-        # Some Bajaj endpoints return text/plain wrapping JSON.
-        try:
-            return json.loads(resp.text)
-        except json.JSONDecodeError:
-            return {"raw": resp.text}
+            data = resp.json()
+        else:
+            try:
+                data = json.loads(resp.text)
+            except json.JSONDecodeError:
+                return {"raw": resp.text}
+
+        self._raise_if_parallel_session_payload(data)
+        return data
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -353,6 +449,68 @@ class BajajClient:
         raise BajajLoginError(
             f"Login HTTP {resp.status_code}: {resp.text[:500]!r}"
         )
+
+    @staticmethod
+    def _collect_message_strings(data: Any, out: list[str], depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(data, dict):
+            for key in (
+                "Message",
+                "message",
+                "ErrorMessage",
+                "errorMessage",
+                "Description",
+                "description",
+                "Msg",
+                "msg",
+                "error",
+                "Error",
+            ):
+                v = data.get(key)
+                if isinstance(v, str) and v.strip():
+                    out.append(v)
+            for v in data.values():
+                if isinstance(v, (dict, list)):
+                    BajajClient._collect_message_strings(v, out, depth + 1)
+        elif isinstance(data, list):
+            for item in data[:20]:
+                BajajClient._collect_message_strings(item, out, depth + 1)
+
+    def _raise_if_parallel_session_payload(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        sc = data.get("StatusCode") or data.get("statusCode")
+        if sc in (409, 440, 441):
+            texts: list[str] = []
+            self._collect_message_strings(data, texts)
+            raise BajajParallelSessionError(
+                texts[0] if texts else "Portal returned a session conflict status."
+            )
+
+        texts = []
+        self._collect_message_strings(data, texts)
+        blob = " ".join(texts).lower()
+        triggers = (
+            "already logged in",
+            "logged in from",
+            "another location",
+            "other machine",
+            "other session",
+            "logged in another",
+            "duplicate login",
+            "another user",
+            "concurrent",
+            "duplicate session",
+            "active session",
+            "please logout",
+            "log out and",
+            "multiple login",
+            "session conflict",
+            "invalid session",
+        )
+        if blob and any(t in blob for t in triggers):
+            raise BajajParallelSessionError(texts[0] if texts else "Session conflict.")
 
 
 class _SessionExpired(Exception):

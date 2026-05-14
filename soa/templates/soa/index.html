@@ -228,6 +228,71 @@
       height: 100%;
     }
 
+    .session-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 20000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .session-modal[hidden] {
+      display: none !important;
+    }
+    .session-modal-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(4px);
+    }
+    .session-modal-card {
+      position: relative;
+      max-width: 440px;
+      width: 100%;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 22px 22px 18px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+    }
+    .session-modal-card h2 {
+      margin: 0 0 10px;
+      font-size: 18px;
+      letter-spacing: -0.02em;
+    }
+    .session-modal-card p {
+      margin: 0 0 18px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .session-modal-detail {
+      font-size: 13px;
+      color: var(--text);
+      background: var(--panel-2);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 18px;
+      max-height: 120px;
+      overflow: auto;
+    }
+    .session-modal-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+    .session-modal-actions button.secondary {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .session-modal-actions button.secondary:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
     footer {
       margin-top: auto;
       padding-top: 24px;
@@ -264,6 +329,22 @@
     <div id="status" class="status" role="status" aria-live="polite"></div>
   </section>
 
+  <div id="session-modal" class="session-modal" hidden aria-hidden="true">
+    <div class="session-modal-backdrop" data-session-modal-dismiss></div>
+    <div class="session-modal-card" role="dialog" aria-modal="true" aria-labelledby="session-modal-title">
+      <h2 id="session-modal-title">Another portal session</h2>
+      <p id="session-modal-desc">
+        Bajaj DMS may have an active session elsewhere for this account. You can end the
+        current portal session on the server, sign in again, and retry the SOA request.
+      </p>
+      <div id="session-modal-detail" class="session-modal-detail" hidden></div>
+      <div class="session-modal-actions">
+        <button type="button" class="secondary" data-session-modal-dismiss>Cancel</button>
+        <button type="button" id="session-modal-logout">Log out &amp; retry</button>
+      </div>
+    </div>
+  </div>
+
   <section id="result" class="card result">
     <div id="result-body"></div>
     <details>
@@ -286,9 +367,14 @@
       const resultEl = document.getElementById('result');
       const resultBody = document.getElementById('result-body');
       const rawJsonEl = document.getElementById('raw-json');
+      const sessionModal = document.getElementById('session-modal');
+      const sessionModalDetail = document.getElementById('session-modal-detail');
+      const sessionModalLogout = document.getElementById('session-modal-logout');
 
       /** @type {string|null} */
       let lastPdfObjectUrl = null;
+      /** @type {string|null} */
+      let pendingConflictAgreement = null;
 
       function setStatus(text, cls) {
         statusEl.textContent = text || '';
@@ -304,6 +390,56 @@
         resultEl.classList.remove('visible');
         resultBody.innerHTML = '';
         rawJsonEl.textContent = '';
+      }
+
+      function hideSessionModal() {
+        sessionModal.hidden = true;
+        sessionModal.setAttribute('aria-hidden', 'true');
+        pendingConflictAgreement = null;
+        sessionModalDetail.hidden = true;
+        sessionModalDetail.textContent = '';
+      }
+
+      function showSessionModal(agreement, detail) {
+        pendingConflictAgreement = agreement;
+        sessionModal.hidden = false;
+        sessionModal.setAttribute('aria-hidden', 'false');
+        if (detail) {
+          sessionModalDetail.hidden = false;
+          sessionModalDetail.textContent = detail;
+        } else {
+          sessionModalDetail.hidden = true;
+          sessionModalDetail.textContent = '';
+        }
+      }
+
+      sessionModal.addEventListener('click', function (e) {
+        if (e.target.closest('[data-session-modal-dismiss]')) hideSessionModal();
+      });
+
+      document.addEventListener('keydown', function (ev) {
+        if (ev.key !== 'Escape') return;
+        if (!sessionModal.hidden) {
+          hideSessionModal();
+          return;
+        }
+        var panel = document.getElementById('soa-pdf-panel');
+        if (!panel || !panel.classList.contains('pdf-panel--fullscreen')) return;
+        panel.classList.remove('pdf-panel--fullscreen');
+        syncPdfFullscreenToggle();
+      });
+
+      async function fetchSoa(agreement, remoteLogoutAndRetry) {
+        const body = remoteLogoutAndRetry
+          ? JSON.stringify({ agreement: agreement, remote_logout_and_retry: true })
+          : JSON.stringify({ agreement: agreement });
+        const r = await fetch('/api/soa', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: body,
+        });
+        const payload = await r.json().catch(function () { return { error: 'Invalid JSON response.' }; });
+        return { ok: r.ok, status: r.status, payload: payload };
       }
 
       function escapeHtml(s) {
@@ -517,12 +653,34 @@
         syncPdfFullscreenToggle();
       });
 
-      document.addEventListener('keydown', function (ev) {
-        if (ev.key !== 'Escape') return;
-        var panel = document.getElementById('soa-pdf-panel');
-        if (!panel || !panel.classList.contains('pdf-panel--fullscreen')) return;
-        panel.classList.remove('pdf-panel--fullscreen');
-        syncPdfFullscreenToggle();
+      sessionModalLogout.addEventListener('click', async function () {
+        const agreement = pendingConflictAgreement || (input.value || '').trim().toUpperCase();
+        if (!agreement) {
+          hideSessionModal();
+          return;
+        }
+        hideSessionModal();
+        submit.disabled = true;
+        setStatus('Logging out portal session and signing in again\u2026');
+        try {
+          const { ok, status, payload } = await fetchSoa(agreement, true);
+          if (!ok) {
+            const detail = payload && (payload.detail || payload.error)
+              ? (payload.detail || payload.error)
+              : ('HTTP ' + status);
+            setStatus('Error: ' + detail, 'error');
+            if (status === 409 && payload && payload.code === 'SESSION_CONFLICT') {
+              showSessionModal(agreement, payload.detail || '');
+            }
+            return;
+          }
+          setStatus('Loaded.', 'ok');
+          render(payload);
+        } catch (err) {
+          setStatus('Network error: ' + err.message, 'error');
+        } finally {
+          submit.disabled = false;
+        }
       });
 
       form.addEventListener('submit', async function (e) {
@@ -536,14 +694,16 @@
         submit.disabled = true;
         setStatus('Fetching SOA from Bajaj DMS\u2026');
         try {
-          const r = await fetch('/api/soa', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-            body: JSON.stringify({ agreement: agreement }),
-          });
-          const payload = await r.json().catch(function () { return { error: 'Invalid JSON response.' }; });
-          if (!r.ok) {
-            const detail = payload && (payload.detail || payload.error) ? (payload.detail || payload.error) : ('HTTP ' + r.status);
+          const { ok, status, payload } = await fetchSoa(agreement, false);
+          if (!ok) {
+            if (status === 409 && payload && payload.code === 'SESSION_CONFLICT') {
+              setStatus('Session conflict — choose Log out & retry if you want to continue.', 'error');
+              showSessionModal(agreement, payload.detail || '');
+              return;
+            }
+            const detail = payload && (payload.detail || payload.error)
+              ? (payload.detail || payload.error)
+              : ('HTTP ' + status);
             setStatus('Error: ' + detail, 'error');
             return;
           }

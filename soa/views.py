@@ -11,7 +11,12 @@ from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_http_methods
 
-from .client import BajajClient, BajajError, BajajLoginError
+from .client import (
+    BajajClient,
+    BajajError,
+    BajajLoginError,
+    BajajParallelSessionError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +57,27 @@ def api_soa(request: HttpRequest) -> JsonResponse:
             status=400,
         )
 
+    force_remote = _wants_remote_logout_retry(request)
     try:
-        data = BajajClient.instance().fetch_soa(agreement)
+        client = BajajClient.instance()
+        if force_remote:
+            data = client.fetch_soa_after_remote_logout(agreement)
+        else:
+            data = client.fetch_soa(agreement)
+    except BajajParallelSessionError as exc:
+        logger.info("Bajaj parallel session / conflict: %s", exc)
+        return JsonResponse(
+            {
+                "agreement": agreement,
+                "code": "SESSION_CONFLICT",
+                "error": (
+                    "The Bajaj portal reports a conflicting or duplicate session "
+                    "for this account."
+                ),
+                "detail": str(exc),
+            },
+            status=409,
+        )
     except BajajLoginError as exc:
         logger.exception("Bajaj login failed")
         return JsonResponse(
@@ -71,6 +95,22 @@ def api_soa(request: HttpRequest) -> JsonResponse:
         {"agreement": agreement, "data": data},
         json_dumps_params={"ensure_ascii": False},
     )
+
+
+def _wants_remote_logout_retry(request: HttpRequest) -> bool:
+    if request.method != "POST":
+        return False
+    ctype = request.content_type or ""
+    if "application/json" not in ctype.lower():
+        return False
+    try:
+        payload = json.loads(request.body or b"{}")
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    flag = payload.get("remote_logout_and_retry")
+    return flag is True or flag == "true" or flag == 1
 
 
 def _extract_agreement(request: HttpRequest) -> str | None:
