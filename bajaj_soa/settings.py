@@ -14,14 +14,20 @@ SECRET_KEY = config(
 )
 DEBUG = config("DJANGO_DEBUG", default=False, cast=bool)
 
-ALLOWED_HOSTS = config(
+_hosts = config(
     "DJANGO_ALLOWED_HOSTS",
-    default="localhost,127.0.0.1",
+    default="*",
     cast=Csv(),
+)
+# Any entry `*` means accept any Host header (LAN, tunnels, etc.).
+ALLOWED_HOSTS = (
+    ["*"]
+    if (not _hosts or any((h or "").strip() == "*" for h in _hosts))
+    else list(_hosts)
 )
 CSRF_TRUSTED_ORIGINS = config(
     "DJANGO_CSRF_TRUSTED_ORIGINS",
-    default="http://localhost:8000,http://127.0.0.1:8000",
+    default="http://localhost:8000,http://127.0.0.1:8000,http://192.168.0.5:8000",
     cast=Csv(),
 )
 

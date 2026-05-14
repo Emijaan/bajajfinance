@@ -155,6 +155,21 @@
       border-radius: 12px;
       overflow: hidden;
       background: var(--panel-2);
+      display: flex;
+      flex-direction: column;
+    }
+    .pdf-panel.pdf-panel--fullscreen {
+      position: fixed;
+      inset: 0;
+      z-index: 10000;
+      margin: 0;
+      border-radius: 0;
+      border: 0;
+      max-width: none;
+      width: 100vw;
+      height: 100vh;
+      height: 100dvh;
+      background: #0b0f14;
     }
     .pdf-toolbar {
       display: flex;
@@ -164,6 +179,18 @@
       padding: 10px 14px;
       border-bottom: 1px solid var(--border);
       background: var(--panel);
+      flex-shrink: 0;
+    }
+    .pdf-panel--fullscreen .pdf-toolbar {
+      padding: 12px 16px;
+      border-bottom-color: var(--border);
+    }
+    .pdf-toolbar-title {
+      font-weight: 700;
+      font-size: 14px;
+      letter-spacing: 0.02em;
+      margin-right: auto;
+      color: var(--text);
     }
     .pdf-toolbar a {
       color: var(--accent);
@@ -172,12 +199,33 @@
       font-size: 14px;
     }
     .pdf-toolbar a:hover { text-decoration: underline; }
+    .pdf-tool-btn {
+      font: inherit;
+      font-weight: 600;
+      font-size: 14px;
+      padding: 8px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      cursor: pointer;
+    }
+    .pdf-tool-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
     .pdf-frame {
       width: 100%;
+      flex: 1 1 auto;
       min-height: 72vh;
       border: 0;
       display: block;
       background: #525659;
+    }
+    .pdf-panel--fullscreen .pdf-frame {
+      min-height: 0;
+      flex: 1 1 0;
+      height: 100%;
     }
 
     footer {
@@ -252,6 +300,7 @@
           URL.revokeObjectURL(lastPdfObjectUrl);
           lastPdfObjectUrl = null;
         }
+        document.body.style.overflow = '';
         resultEl.classList.remove('visible');
         resultBody.innerHTML = '';
         rawJsonEl.textContent = '';
@@ -340,15 +389,26 @@
         lastPdfObjectUrl = objectUrl;
         var fname = 'SOA-' + agreement + '.pdf';
         return (
-          '<div class="pdf-panel">'
-          + '<div class="section-title">Statement of Account (PDF)</div>'
+          '<div class="pdf-panel pdf-panel--fullscreen" id="soa-pdf-panel" role="region" aria-label="Statement of Account PDF">'
           + '<div class="pdf-toolbar">'
+          + '<span class="pdf-toolbar-title">SOA &middot; ' + escapeHtml(agreement) + '</span>'
           + '<a href="' + objectUrl + '" download="' + escapeHtml(fname) + '">Download PDF</a>'
           + '<a href="' + objectUrl + '" target="_blank" rel="noopener">Open in new tab</a>'
+          + '<button type="button" class="pdf-tool-btn" data-pdf-toggle aria-expanded="true">Exit full screen</button>'
           + '</div>'
-          + '<iframe class="pdf-frame" title="SOA PDF" src="' + objectUrl + '#view=FitH"></iframe>'
+          + '<iframe class="pdf-frame" id="soa-pdf-frame" title="SOA PDF" src="' + objectUrl + '#view=FitH"></iframe>'
           + '</div>'
         );
+      }
+
+      function syncPdfFullscreenToggle() {
+        var panel = document.getElementById('soa-pdf-panel');
+        var btn = resultEl.querySelector('[data-pdf-toggle]');
+        if (!panel || !btn) return;
+        var fs = panel.classList.contains('pdf-panel--fullscreen');
+        document.body.style.overflow = fs ? 'hidden' : '';
+        btn.textContent = fs ? 'Exit full screen' : 'Full screen';
+        btn.setAttribute('aria-expanded', fs ? 'true' : 'false');
       }
 
       /**
@@ -441,7 +501,29 @@
           + pdfBlock
           + renderValue(displayData, null);
         resultEl.classList.add('visible');
+        if (pdfB64) {
+          syncPdfFullscreenToggle();
+        } else {
+          document.body.style.overflow = '';
+        }
       }
+
+      resultEl.addEventListener('click', function (e) {
+        var btn = e.target.closest('[data-pdf-toggle]');
+        if (!btn) return;
+        var panel = document.getElementById('soa-pdf-panel');
+        if (!panel) return;
+        panel.classList.toggle('pdf-panel--fullscreen');
+        syncPdfFullscreenToggle();
+      });
+
+      document.addEventListener('keydown', function (ev) {
+        if (ev.key !== 'Escape') return;
+        var panel = document.getElementById('soa-pdf-panel');
+        if (!panel || !panel.classList.contains('pdf-panel--fullscreen')) return;
+        panel.classList.remove('pdf-panel--fullscreen');
+        syncPdfFullscreenToggle();
+      });
 
       form.addEventListener('submit', async function (e) {
         e.preventDefault();
