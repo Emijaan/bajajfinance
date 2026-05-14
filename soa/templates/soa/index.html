@@ -148,6 +148,38 @@
     }
     .kv .k { color: var(--muted); }
     .table-wrap { overflow-x: auto; max-height: 540px; border: 1px solid var(--border); border-radius: 10px; }
+
+    .pdf-panel {
+      margin-bottom: 20px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      background: var(--panel-2);
+    }
+    .pdf-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      align-items: center;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    .pdf-toolbar a {
+      color: var(--accent);
+      font-weight: 600;
+      text-decoration: none;
+      font-size: 14px;
+    }
+    .pdf-toolbar a:hover { text-decoration: underline; }
+    .pdf-frame {
+      width: 100%;
+      min-height: 72vh;
+      border: 0;
+      display: block;
+      background: #525659;
+    }
+
     footer {
       margin-top: auto;
       padding-top: 24px;
@@ -207,12 +239,19 @@
       const resultBody = document.getElementById('result-body');
       const rawJsonEl = document.getElementById('raw-json');
 
+      /** @type {string|null} */
+      let lastPdfObjectUrl = null;
+
       function setStatus(text, cls) {
         statusEl.textContent = text || '';
         statusEl.className = 'status' + (cls ? ' ' + cls : '');
       }
 
       function clearResult() {
+        if (lastPdfObjectUrl) {
+          URL.revokeObjectURL(lastPdfObjectUrl);
+          lastPdfObjectUrl = null;
+        }
         resultEl.classList.remove('visible');
         resultBody.innerHTML = '';
         rawJsonEl.textContent = '';
@@ -265,6 +304,110 @@
         return html;
       }
 
+      /**
+       * Bajaj returns the SOA as base64 PDF bytes in a `url` field (often nested:
+       * e.g. `data.data[0].url`, not only top-level `data.url`).
+       * @param {string} s
+       */
+      function isLikelyPdfBase64(s) {
+        if (!s || typeof s !== 'string' || s.length < 24) return false;
+        var t = s.replace(/\s/g, '');
+        if (t.startsWith('JVBERi')) return true;
+        try {
+          var take = Math.min(t.length, 48);
+          var chunk = t.slice(0, take);
+          var pad = chunk.length % 4 ? '='.repeat(4 - (chunk.length % 4)) : '';
+          var bin = atob(chunk + pad);
+          return bin.slice(0, 4) === '%PDF';
+        } catch (e) {
+          return false;
+        }
+      }
+
+      /**
+       * @param {string} b64
+       * @param {string} agreement
+       */
+      function renderPdfPanel(b64, agreement) {
+        var clean = b64.replace(/\s/g, '');
+        var binary = atob(clean);
+        var len = binary.length;
+        var bytes = new Uint8Array(len);
+        for (var i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+        var blob = new Blob([bytes], { type: 'application/pdf' });
+        var objectUrl = URL.createObjectURL(blob);
+        if (lastPdfObjectUrl) URL.revokeObjectURL(lastPdfObjectUrl);
+        lastPdfObjectUrl = objectUrl;
+        var fname = 'SOA-' + agreement + '.pdf';
+        return (
+          '<div class="pdf-panel">'
+          + '<div class="section-title">Statement of Account (PDF)</div>'
+          + '<div class="pdf-toolbar">'
+          + '<a href="' + objectUrl + '" download="' + escapeHtml(fname) + '">Download PDF</a>'
+          + '<a href="' + objectUrl + '" target="_blank" rel="noopener">Open in new tab</a>'
+          + '</div>'
+          + '<iframe class="pdf-frame" title="SOA PDF" src="' + objectUrl + '#view=FitH"></iframe>'
+          + '</div>'
+        );
+      }
+
+      /**
+       * Walk objects/arrays and return the first base64 PDF found in any `url` field.
+       * @param {unknown} data
+       * @returns {string|null}
+       */
+      function extractPdfBase64(data) {
+        if (data == null) return null;
+        if (typeof data !== 'object') return null;
+        if (Array.isArray(data)) {
+          for (var i = 0; i < data.length; i++) {
+            var fromArr = extractPdfBase64(data[i]);
+            if (fromArr) return fromArr;
+          }
+          return null;
+        }
+        var u = data.url;
+        if (typeof u === 'string' && isLikelyPdfBase64(u)) return u;
+        var keys = Object.keys(data);
+        for (var j = 0; j < keys.length; j++) {
+          var child = extractPdfBase64(data[keys[j]]);
+          if (child) return child;
+        }
+        return null;
+      }
+
+      /**
+       * Deep-clone-ish: replace any `url` that looks like a PDF with a short placeholder.
+       * @param {unknown} value
+       */
+      function stripPdfFromTree(value) {
+        if (value == null) return value;
+        if (Array.isArray(value)) {
+          return value.map(function (item) { return stripPdfFromTree(item); });
+        }
+        if (typeof value === 'object') {
+          var out = {};
+          Object.keys(value).forEach(function (k) {
+            var v = value[k];
+            if (k === 'url' && typeof v === 'string' && isLikelyPdfBase64(v)) {
+              out[k] = '(PDF embedded — see viewer above)';
+            } else {
+              out[k] = stripPdfFromTree(v);
+            }
+          });
+          return out;
+        }
+        return value;
+      }
+
+      /**
+       * Replace huge PDF payload(s) with a short placeholder for the structured view.
+       * @param {unknown} data
+       */
+      function sanitizeDataForKv(data) {
+        return stripPdfFromTree(data);
+      }
+
       function renderValue(value, title) {
         if (Array.isArray(value)) {
           return (title ? '<div class="section-title">' + escapeHtml(title) + ' (' + value.length + ')</div>' : '')
@@ -289,11 +432,14 @@
       function render(payload) {
         rawJsonEl.textContent = JSON.stringify(payload, null, 2);
         const data = payload && payload.data !== undefined ? payload.data : payload;
+        const agreement = String(payload.agreement || input.value || '').toUpperCase();
+        const pdfB64 = extractPdfBase64(data);
+        const displayData = pdfB64 ? sanitizeDataForKv(data) : data;
+        var pdfBlock = pdfB64 ? renderPdfPanel(pdfB64, agreement) : '';
         resultBody.innerHTML =
-          '<div class="section-title">Agreement '
-          + escapeHtml(payload.agreement || input.value.toUpperCase())
-          + '</div>'
-          + renderValue(data, null);
+          '<div class="section-title">Agreement ' + escapeHtml(agreement) + '</div>'
+          + pdfBlock
+          + renderValue(displayData, null);
         resultEl.classList.add('visible');
       }
 
