@@ -5,5 +5,6 @@ from . import views
 urlpatterns = [
     path("", views.index, name="index"),
     path("api/soa", views.api_soa, name="api_soa"),
+    path("reports/payments", views.payment_report, name="payment_report"),
     path("healthz", views.healthz, name="healthz"),
 ]

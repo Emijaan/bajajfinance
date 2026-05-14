@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Batch payment report &middot; Bajaj DMS</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #1f2937;
+      --border: #334155;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #38bdf8;
+      --accent-strong: #0284c7;
+      --danger: #f87171;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1e293b 0%, var(--bg) 60%) fixed;
+      color: var(--text);
+      padding: 32px 16px 64px;
+    }
+    header { max-width: 720px; margin: 0 auto 24px; }
+    h1 { font-size: 22px; margin: 0 0 8px; letter-spacing: -0.01em; }
+    .subtitle { color: var(--muted); font-size: 14px; }
+    .subtitle a { color: var(--accent); font-weight: 600; text-decoration: none; }
+    .subtitle a:hover { text-decoration: underline; }
+    .card {
+      max-width: 720px;
+      margin: 0 auto;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 20px;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+    }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    .field { margin-bottom: 16px; }
+    input[type="file"],
+    input[type="date"] {
+      width: 100%;
+      max-width: 100%;
+      padding: 10px 12px;
+      font-size: 15px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 10px;
+    }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .row .field { flex: 1 1 200px; margin-bottom: 0; }
+    button[type="submit"] {
+      margin-top: 8px;
+      padding: 12px 22px;
+      font-size: 15px;
+      font-weight: 600;
+      background: var(--accent);
+      color: #06121d;
+      border: 0;
+      border-radius: 10px;
+      cursor: pointer;
+    }
+    button[type="submit"]:hover { background: var(--accent-strong); color: #fff; }
+    .error {
+      background: rgba(248, 113, 113, 0.12);
+      border: 1px solid var(--danger);
+      color: #fecaca;
+      padding: 12px 14px;
+      border-radius: 10px;
+      margin-bottom: 16px;
+      font-size: 14px;
+    }
+    .hint { font-size: 13px; color: var(--muted); margin-top: 16px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Batch payment report</h1>
+    <div class="subtitle">
+      Upload an Excel file with a <strong>loan no</strong> column, set the date window, then download
+      consolidated <strong>Payment Received</strong> rows (online vs cash). <a href="{% url 'index' %}">Single SOA lookup</a>
+    </div>
+  </header>
+
+  <section class="card">
+    {% if error %}
+      <div class="error" role="alert">{{ error }}</div>
+    {% endif %}
+    <form method="post" enctype="multipart/form-data" action="{% url 'payment_report' %}">
+      {% csrf_token %}
+      <div class="field">
+        <label for="file">Excel file (.xlsx)</label>
+        <input id="file" name="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required />
+      </div>
+      <div class="row">
+        <div class="field">
+          <label for="date_from">Date from</label>
+          <input id="date_from" name="date_from" type="date" value="{{ date_from|default:'' }}" required />
+        </div>
+        <div class="field">
+          <label for="date_to">Date to</label>
+          <input id="date_to" name="date_to" type="date" value="{{ date_to|default:'' }}" required />
+        </div>
+      </div>
+      <button type="submit">Run report</button>
+    </form>
+    <p class="hint">
+      First row must include a column header such as <code>loan no</code> or <code>agreement</code>.
+      Rows are matched when text includes <em>Payment Received</em> plus either
+      <code>ONLINE payment No</code> or <code>CASH payment No</code> (Bajaj SOA layout), or older
+      ONLINE / reference wording.
+    </p>
+  </section>
+</body>
+</html>

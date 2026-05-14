@@ -5,18 +5,23 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import date, datetime
+from io import BytesIO
 
-from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.conf import settings
+from django.http import FileResponse, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import render
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import csrf_exempt, csrf_protect
 from django.views.decorators.http import require_GET, require_http_methods
 
+from .batch_report import build_payment_report
 from .client import (
     BajajClient,
     BajajError,
     BajajLoginError,
     BajajParallelSessionError,
 )
+from .excel_io import read_loan_numbers_from_xlsx, write_payment_report_xlsx
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +100,122 @@ def api_soa(request: HttpRequest) -> JsonResponse:
         {"agreement": agreement, "data": data},
         json_dumps_params={"ensure_ascii": False},
     )
+
+
+@csrf_protect
+@require_http_methods(["GET", "POST"])
+def payment_report(request: HttpRequest) -> HttpResponse:
+    """Upload Excel (loan numbers), date range → download payment report xlsx."""
+    if request.method == "GET":
+        return render(request, "soa/payment_report.html")
+
+    err: str | None = None
+    upload = request.FILES.get("file")
+    if not upload:
+        err = "Please choose an Excel file (.xlsx)."
+    elif upload.size > int(settings.SOA_BATCH_MAX_UPLOAD_BYTES):
+        err = (
+            f"File too large (max {settings.SOA_BATCH_MAX_UPLOAD_BYTES // (1024 * 1024)} MB)."
+        )
+    else:
+        name = (upload.name or "").lower()
+        if not name.endswith(".xlsx"):
+            err = "Only .xlsx files are supported."
+
+    df_raw = request.POST.get("date_from", "").strip()
+    dt_raw = request.POST.get("date_to", "").strip()
+    date_from: date | None = None
+    date_to: date | None = None
+    try:
+        if df_raw:
+            date_from = datetime.strptime(df_raw, "%Y-%m-%d").date()
+        if dt_raw:
+            date_to = datetime.strptime(dt_raw, "%Y-%m-%d").date()
+    except ValueError:
+        if err is None:
+            err = "Invalid date format. Use the date pickers (YYYY-MM-DD)."
+
+    if err is None and (date_from is None or date_to is None):
+        err = "Both date from and date to are required."
+
+    if err:
+        return render(
+            request,
+            "soa/payment_report.html",
+            {"error": err, "date_from": df_raw, "date_to": dt_raw},
+            status=400,
+        )
+
+    assert date_from is not None and date_to is not None
+
+    try:
+        raw = upload.read()
+        loans = read_loan_numbers_from_xlsx(raw)
+    except ValueError as exc:
+        return render(
+            request,
+            "soa/payment_report.html",
+            {"error": str(exc), "date_from": df_raw, "date_to": dt_raw},
+            status=400,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to read upload")
+        return render(
+            request,
+            "soa/payment_report.html",
+            {
+                "error": f"Could not read Excel: {exc}",
+                "date_from": df_raw,
+                "date_to": dt_raw,
+            },
+            status=400,
+        )
+
+    if not loans:
+        return render(
+            request,
+            "soa/payment_report.html",
+            {
+                "error": "No loan numbers found under the detected header row.",
+                "date_from": df_raw,
+                "date_to": dt_raw,
+            },
+            status=400,
+        )
+
+    try:
+        payments, statuses = build_payment_report(loans, date_from, date_to)
+    except ValueError as exc:
+        return render(
+            request,
+            "soa/payment_report.html",
+            {"error": str(exc), "date_from": df_raw, "date_to": dt_raw},
+            status=400,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Batch report failed")
+        return render(
+            request,
+            "soa/payment_report.html",
+            {
+                "error": str(exc),
+                "date_from": df_raw,
+                "date_to": dt_raw,
+            },
+            status=502,
+        )
+
+    xlsx = write_payment_report_xlsx(payments, statuses)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    resp = FileResponse(
+        BytesIO(xlsx),
+        as_attachment=True,
+        filename=f"soa-payments-{stamp}.xlsx",
+        content_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+    )
+    return resp
 
 
 def _wants_remote_logout_retry(request: HttpRequest) -> bool:

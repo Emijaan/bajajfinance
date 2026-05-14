@@ -39,6 +39,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
@@ -114,3 +115,10 @@ LOGGING = {
 # --- Bajaj DMS credentials (consumed by soa.client.BajajClient) ---
 BAJAJ_USERNAME = config("BAJAJ_USERNAME", default="")
 BAJAJ_PASSWORD = config("BAJAJ_PASSWORD", default="")
+
+# --- Batch payment report (soa.batch_report / payment_report view) ---
+SOA_BATCH_DELAY_SECONDS = config("SOA_BATCH_DELAY_SECONDS", default=0.35, cast=float)
+SOA_BATCH_MAX_LOANS = config("SOA_BATCH_MAX_LOANS", default=500, cast=int)
+SOA_BATCH_MAX_UPLOAD_BYTES = config(
+    "SOA_BATCH_MAX_UPLOAD_BYTES", default=2_097_152, cast=int
+)
