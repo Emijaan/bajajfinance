@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SOA Lookup &middot; Bajaj DMS</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #1f2937;
+      --border: #334155;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #38bdf8;
+      --accent-strong: #0284c7;
+      --danger: #f87171;
+      --ok: #34d399;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1e293b 0%, var(--bg) 60%) fixed;
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 32px 16px 64px;
+    }
+    header {
+      width: 100%;
+      max-width: 960px;
+      margin-bottom: 24px;
+    }
+    h1 {
+      font-size: 22px;
+      margin: 0 0 4px;
+      letter-spacing: -0.01em;
+    }
+    .subtitle { color: var(--muted); font-size: 14px; }
+
+    .card {
+      width: 100%;
+      max-width: 960px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+    }
+
+    form { display: flex; gap: 12px; flex-wrap: wrap; }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    .field { flex: 1 1 280px; }
+    input[type="text"] {
+      width: 100%;
+      padding: 12px 14px;
+      font-size: 15px;
+      font-family: ui-monospace, "JetBrains Mono", Consolas, monospace;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 10px;
+      outline: none;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    input[type="text"]:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.25);
+    }
+    button {
+      align-self: flex-end;
+      padding: 12px 22px;
+      font-size: 15px;
+      font-weight: 600;
+      background: var(--accent);
+      color: #06121d;
+      border: 0;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.05s;
+    }
+    button:hover { background: var(--accent-strong); color: #fff; }
+    button:active { transform: translateY(1px); }
+    button[disabled] { opacity: 0.6; cursor: progress; }
+
+    .status { margin-top: 14px; font-size: 14px; color: var(--muted); }
+    .status.error { color: var(--danger); }
+    .status.ok { color: var(--ok); }
+
+    .result { display: none; }
+    .result.visible { display: block; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      background: var(--panel-2);
+      position: sticky;
+      top: 0;
+    }
+    tr:hover td { background: rgba(56, 189, 248, 0.06); }
+    .section-title {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin: 20px 0 8px;
+    }
+    pre {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 480px;
+      font-size: 12.5px;
+      line-height: 1.45;
+    }
+    details summary {
+      cursor: pointer;
+      color: var(--muted);
+      margin-top: 16px;
+    }
+    .kv {
+      display: grid;
+      grid-template-columns: minmax(160px, 220px) 1fr;
+      gap: 6px 16px;
+    }
+    .kv .k { color: var(--muted); }
+    .table-wrap { overflow-x: auto; max-height: 540px; border: 1px solid var(--border); border-radius: 10px; }
+    footer {
+      margin-top: auto;
+      padding-top: 24px;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Statement of Account &mdash; lookup</h1>
+    <div class="subtitle">Enter an Agreement Number to fetch its SOA from the Bajaj DMS portal.</div>
+  </header>
+
+  <section class="card">
+    <form id="soa-form" autocomplete="off">
+      <div class="field">
+        <label for="agreement">Agreement Number</label>
+        <input
+          id="agreement"
+          name="agreement"
+          type="text"
+          required
+          minlength="5"
+          maxlength="40"
+          pattern="[A-Za-z0-9]{5,40}"
+          placeholder="e.g. P6D9PRR66028313"
+          autofocus
+        />
+      </div>
+      <button id="submit" type="submit">Fetch SOA</button>
+    </form>
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+  </section>
+
+  <section id="result" class="card result">
+    <div id="result-body"></div>
+    <details>
+      <summary>Raw JSON response</summary>
+      <pre id="raw-json"></pre>
+    </details>
+  </section>
+
+  <footer>
+    Personal use only. The SOA returned here is whatever the configured Bajaj
+    DMS account can see.
+  </footer>
+
+  <script>
+    (function () {
+      const form = document.getElementById('soa-form');
+      const input = document.getElementById('agreement');
+      const submit = document.getElementById('submit');
+      const statusEl = document.getElementById('status');
+      const resultEl = document.getElementById('result');
+      const resultBody = document.getElementById('result-body');
+      const rawJsonEl = document.getElementById('raw-json');
+
+      function setStatus(text, cls) {
+        statusEl.textContent = text || '';
+        statusEl.className = 'status' + (cls ? ' ' + cls : '');
+      }
+
+      function clearResult() {
+        resultEl.classList.remove('visible');
+        resultBody.innerHTML = '';
+        rawJsonEl.textContent = '';
+      }
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+          return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+        });
+      }
+
+      function formatCell(v) {
+        if (v === null || v === undefined || v === '') return '<span style="color:var(--muted)">&mdash;</span>';
+        if (typeof v === 'object') return '<code>' + escapeHtml(JSON.stringify(v)) + '</code>';
+        return escapeHtml(v);
+      }
+
+      function renderTable(rows) {
+        if (!rows.length) return '<div class="subtitle">(empty list)</div>';
+        const cols = Array.from(
+          rows.reduce(function (set, row) {
+            if (row && typeof row === 'object') {
+              Object.keys(row).forEach(function (k) { set.add(k); });
+            }
+            return set;
+          }, new Set())
+        );
+        let html = '<div class="table-wrap"><table><thead><tr>';
+        cols.forEach(function (c) { html += '<th>' + escapeHtml(c) + '</th>'; });
+        html += '</tr></thead><tbody>';
+        rows.forEach(function (row) {
+          html += '<tr>';
+          cols.forEach(function (c) { html += '<td>' + formatCell(row ? row[c] : null) + '</td>'; });
+          html += '</tr>';
+        });
+        html += '</tbody></table></div>';
+        return html;
+      }
+
+      function renderKV(obj) {
+        const entries = Object.entries(obj);
+        if (!entries.length) return '<div class="subtitle">(no fields)</div>';
+        let html = '<div class="kv">';
+        entries.forEach(function (e) {
+          const k = e[0], v = e[1];
+          html += '<div class="k">' + escapeHtml(k) + '</div>';
+          html += '<div>' + formatCell(v) + '</div>';
+        });
+        html += '</div>';
+        return html;
+      }
+
+      function renderValue(value, title) {
+        if (Array.isArray(value)) {
+          return (title ? '<div class="section-title">' + escapeHtml(title) + ' (' + value.length + ')</div>' : '')
+            + renderTable(value);
+        }
+        if (value && typeof value === 'object') {
+          // Try to find array-of-rows children; render them as tables, the rest as KV.
+          const arrayKeys = [], scalarObj = {};
+          Object.keys(value).forEach(function (k) {
+            if (Array.isArray(value[k])) arrayKeys.push(k);
+            else scalarObj[k] = value[k];
+          });
+          let html = '';
+          if (title) html += '<div class="section-title">' + escapeHtml(title) + '</div>';
+          if (Object.keys(scalarObj).length) html += renderKV(scalarObj);
+          arrayKeys.forEach(function (k) { html += renderValue(value[k], k); });
+          return html;
+        }
+        return '<div>' + formatCell(value) + '</div>';
+      }
+
+      function render(payload) {
+        rawJsonEl.textContent = JSON.stringify(payload, null, 2);
+        const data = payload && payload.data !== undefined ? payload.data : payload;
+        resultBody.innerHTML =
+          '<div class="section-title">Agreement '
+          + escapeHtml(payload.agreement || input.value.toUpperCase())
+          + '</div>'
+          + renderValue(data, null);
+        resultEl.classList.add('visible');
+      }
+
+      form.addEventListener('submit', async function (e) {
+        e.preventDefault();
+        clearResult();
+        const agreement = (input.value || '').trim().toUpperCase();
+        if (!agreement) {
+          setStatus('Please enter an agreement number.', 'error');
+          return;
+        }
+        submit.disabled = true;
+        setStatus('Fetching SOA from Bajaj DMS\u2026');
+        try {
+          const r = await fetch('/api/soa', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({ agreement: agreement }),
+          });
+          const payload = await r.json().catch(function () { return { error: 'Invalid JSON response.' }; });
+          if (!r.ok) {
+            const detail = payload && (payload.detail || payload.error) ? (payload.detail || payload.error) : ('HTTP ' + r.status);
+            setStatus('Error: ' + detail, 'error');
+            return;
+          }
+          setStatus('Loaded.', 'ok');
+          render(payload);
+        } catch (err) {
+          setStatus('Network error: ' + err.message, 'error');
+        } finally {
+          submit.disabled = false;
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
