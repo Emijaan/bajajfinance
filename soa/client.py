@@ -1,5 +1,10 @@
 """HTTP client that maintains a hot session against the Bajaj DMS portal.
 
+The ``/login/api/Authorize/Login`` POST uses a **minimal** header set; dressing it
+like an agency XHR often yields ``400 Cannot process this request!!!``. Agency
+routes (``/agency/...``) use document navigations and XHR-style headers with
+``Sourceuri`` / ``Estag`` where the portal expects them.
+
 The portal expects its login payload to be JSON-stringified, RSA-encrypted
 with a public key embedded in its frontend bundle (node-forge, PKCS#1 v1.5
 padding), then base64-encoded. After login it issues a short-lived JWT
@@ -48,23 +53,125 @@ iwIDAQAB
 
 BASE_URL = "https://dmsoneportal.bajajfinserv.in"
 
+# SOA POST returns these when the portal/WAF rejects cookies or signing; treat
+# like session expiry so ``fetch_soa`` can re-login and retry (474 is non‑RFC
+# but appears with body ``Request is not authorized.`` on some paths).
+_SOA_AUTH_RETRY_STATUSES = frozenset({401, 403, 474})
+
 # Fallback JWT renew lead (seconds) when ``BAJAJ_SESSION_RENEW_BUFFER_SECONDS`` is unset.
 # Each ``fetch_soa`` runs ``_ensure_session``; use ~3 minutes so long batches renew
 # before the ~15-minute portal cookie expires.
 RENEW_BUFFER_SECONDS = 180
 
-# Modern Chrome on Windows. Bajaj sniffs UA in places.
-_BROWSER_HEADERS = {
-    "User-Agent": (
+# Chrome profile (Windows) — keep UA and Sec-CH-UA aligned (matches prior portal).
+_CHROME_MAJOR = "137"
+
+
+def _user_agent_chrome_windows() -> str:
+    return (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/137.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Sec-Ch-Ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-}
+        f"Chrome/{_CHROME_MAJOR}.0.0.0 Safari/537.36"
+    )
+
+
+def _chrome_client_hints() -> dict[str, str]:
+    return {
+        "Sec-Ch-Ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+    }
+
+
+def _chrome_base_headers() -> dict[str, str]:
+    """Headers sent on almost every request (matches real Chrome defaults)."""
+    h: dict[str, str] = {
+        "User-Agent": _user_agent_chrome_windows(),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+    }
+    h.update(_chrome_client_hints())
+    return h
+
+
+def _html_document_headers(*, referer: str, site: str = "same-origin") -> dict[str, str]:
+    """Top-level navigation (HTML document) like opening a tab."""
+    h = _chrome_base_headers()
+    h.update(
+        {
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,image/apng,*/*;q=0.8"
+            ),
+            "Referer": referer,
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": site,
+            "Sec-Fetch-User": "?1",
+            "Priority": "u=0, i",
+        }
+    )
+    return h
+
+
+def _xhr_json_headers(
+    *,
+    referer: str,
+    source_uri: str | None = None,
+    estag: str | None = None,
+) -> dict[str, str]:
+    """Angular-style JSON XHR/fetch to the same origin (agency + login APIs)."""
+    h = _chrome_base_headers()
+    h.update(
+        {
+            "Accept": "application/json, text/plain, */*",
+            "Origin": BASE_URL,
+            "Referer": referer,
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Priority": "u=1, i",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+    )
+    if source_uri is not None:
+        h["Sourceuri"] = source_uri
+    if estag is not None:
+        h["Estag"] = estag
+    return h
+
+
+def _login_authorize_headers() -> dict[str, str]:
+    """Headers for ``POST …/Authorize/Login`` only.
+
+    Bajaj/WAF often answers ``400 Cannot process this request!!!`` when this
+    call is sent with full Angular agency XHR decoration (``Sec-Fetch-*``,
+    ``X-Requested-With``, ``Show-Spinner``) or when a scripted ``GET /login/``
+    precedes it. Keep this POST aligned with the original minimal browser POST.
+    """
+    h = _chrome_base_headers()
+    h.update(
+        {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": BASE_URL,
+            "Referer": f"{BASE_URL}/login/",
+        }
+    )
+    return h
+
+
+def _login_json_get_headers(*, referer: str) -> dict[str, str]:
+    """Light JSON GET on the login app (e.g. COC) without agency XHR headers."""
+    h = _chrome_base_headers()
+    h.update(
+        {
+            "Accept": "application/json, text/plain, */*",
+            "Referer": referer,
+        }
+    )
+    return h
 
 
 class BajajError(RuntimeError):
@@ -98,7 +205,7 @@ class BajajClient:
         )  # type: ignore[assignment]
 
         self._session = requests.Session()
-        self._session.headers.update(_BROWSER_HEADERS)
+        self._session.headers.update(_chrome_base_headers())
 
         self._lock = threading.RLock()
         self._expires_at: datetime | None = None
@@ -276,12 +383,7 @@ class BajajClient:
         login_key = self._encrypt_login_key(plaintext_payload)
 
         url = f"{BASE_URL}/login/api/Authorize/Login"
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json",
-            "Origin": BASE_URL,
-            "Referer": f"{BASE_URL}/login/",
-        }
+        headers = _login_authorize_headers()
         body = {"cloudProvider": None, "LoginKey": login_key}
 
         logger.debug("POST %s (LoginKey=%d chars)", url, len(login_key))
@@ -328,10 +430,7 @@ class BajajClient:
                         "userid": self._user_id,
                         "cocAcceptanceSource": "DMS_WEB",
                     },
-                    headers={
-                        "Accept": "application/json, text/plain, */*",
-                        "Referer": f"{BASE_URL}/login/",
-                    },
+                    headers=_login_json_get_headers(referer=f"{BASE_URL}/login/"),
                     timeout=20,
                 )
             except requests.RequestException as exc:
@@ -355,31 +454,31 @@ class BajajClient:
         try:
             self._session.get(
                 f"{BASE_URL}/agency/home",
-                headers={
-                    "Accept": (
-                        "text/html,application/xhtml+xml,application/xml;"
-                        "q=0.9,image/avif,image/webp,*/*;q=0.8"
-                    ),
-                    "Referer": f"{BASE_URL}/login/",
-                    "Upgrade-Insecure-Requests": "1",
-                },
-                timeout=20,
+                headers=_html_document_headers(referer=f"{BASE_URL}/login/"),
+                timeout=25,
+                allow_redirects=True,
             )
             home_resp = self._session.get(
                 f"{BASE_URL}/agency/api/Auth/home",
                 headers={
-                    "Accept": "application/json, text/plain, */*",
-                    "Sourceuri": f"{BASE_URL}/agency/home",
-                    "Referer": f"{BASE_URL}/agency/home",
+                    **_xhr_json_headers(
+                        referer=f"{BASE_URL}/agency/home",
+                        source_uri=f"{BASE_URL}/agency/home",
+                        estag="",
+                    ),
                     "Show-Spinner": "true",
-                    "X-Requested-With": "XMLHttpRequest",
-                    # GET with no body -> empty Estag (btoa("") === "")
-                    "Estag": "",
                 },
                 timeout=20,
             )
             logger.debug(
                 "Primed /agency/api/Auth/home -> %s", home_resp.status_code
+            )
+            # Load the SOA shell route like the Angular app before report XHRs.
+            self._session.get(
+                f"{BASE_URL}/agency/others/agency-soa",
+                headers=_html_document_headers(referer=f"{BASE_URL}/agency/home"),
+                timeout=25,
+                allow_redirects=True,
             )
         except requests.RequestException as exc:
             logger.warning("Agency priming failed (non-fatal): %s", exc)
@@ -407,14 +506,13 @@ class BajajClient:
         estag = self._compute_estag(body_bytes)
         url = f"{BASE_URL}/common/api/Auth/UpdateLogoutInfo"
         headers = {
-            "Accept": "application/json, text/plain, */*",
+            **_xhr_json_headers(
+                referer=f"{BASE_URL}/agency/home",
+                source_uri=f"{BASE_URL}/agency/home",
+                estag=estag,
+            ),
             "Content-Type": "application/json",
-            "Origin": BASE_URL,
-            "Referer": f"{BASE_URL}/agency/home",
-            "Sourceuri": f"{BASE_URL}/agency/home",
-            "X-Requested-With": "XMLHttpRequest",
             "Show-Spinner": "true",
-            "Estag": estag,
         }
         try:
             resp = self._session.post(
@@ -427,15 +525,11 @@ class BajajClient:
         try:
             self._session.get(
                 f"{BASE_URL}/login",
-                headers={
-                    "Accept": (
-                        "text/html,application/xhtml+xml,application/xml;"
-                        "q=0.9,image/avif,image/webp,*/*;q=0.8"
-                    ),
-                    "Referer": f"{BASE_URL}/agency/home",
-                    "Upgrade-Insecure-Requests": "1",
-                },
+                headers=_html_document_headers(
+                    referer=f"{BASE_URL}/agency/home",
+                ),
                 timeout=20,
+                allow_redirects=True,
             )
         except requests.RequestException as exc:
             logger.warning("GET /login after logout failed (non-fatal): %s", exc)
@@ -477,19 +571,18 @@ class BajajClient:
         estag = self._compute_estag(body_bytes)
 
         headers = {
-            "Accept": "application/json, text/plain, */*",
+            **_xhr_json_headers(
+                referer=f"{BASE_URL}/agency/others/agency-soa",
+                source_uri=f"{BASE_URL}/agency/others/agency-soa",
+                estag=estag,
+            ),
             "Content-Type": "application/json",
-            "Origin": BASE_URL,
-            "Referer": f"{BASE_URL}/agency/others/agency-soa",
-            "Sourceuri": f"{BASE_URL}/agency/others/agency-soa",
-            "X-Requested-With": "XMLHttpRequest",
             "Show-Spinner": "true",
-            "Estag": estag,
         }
         logger.debug("POST %s body=%s estag=%s", url, body_bytes, estag)
         resp = sess.post(url, data=body_bytes, headers=headers, timeout=60)
 
-        if resp.status_code in (401, 403):
+        if resp.status_code in _SOA_AUTH_RETRY_STATUSES:
             raise _SessionExpired(resp.status_code)
         if not resp.ok:
             logger.error(
@@ -608,7 +701,7 @@ class BajajClient:
 
 
 class _SessionExpired(Exception):
-    """Internal marker: we should drop the session and re-login once."""
+    """Internal marker: re-login and retry the SOA request (401/403/474, etc.)."""
 
     def __init__(self, status: int) -> None:
         super().__init__(f"session expired (HTTP {status})")
